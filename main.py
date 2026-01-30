@@ -18,6 +18,32 @@ UNCERTAIN_TOTAL_CAP = 20.0  # total seconds of UNCERTAIN before forced DISTRACTE
 EYE_CLOSED_EAR = 0.20       # Eye Aspect Ratio threshold
 ROLL_THRESHOLD = 15         # degrees (head tilt tolerance)
 YAW_THRESHOLD = 10          # proxy units (nose displacement)
+
+# Resume Screen Settings
+RESUME_SCREEN_THRESHOLD = 30.0   # seconds in DISTRACTED before resume screen
+RESUME_GAZE_DURATION = 2.0       # seconds of focus required to resume
+
+# Session Configuration
+SESSION_GOAL_MINUTES = 25        # Pomodoro default
+SESSION_GOAL_SECONDS = SESSION_GOAL_MINUTES * 60
+
+# Task Types (Fixed List)
+TASK_TYPES = [
+    "Deep Work",
+    "Learning/Study",
+    "Writing",
+    "Coding",
+    "Reading",
+    "Admin/Email",
+    "Creative Work",
+    "Meeting Prep",
+    "Review/Editing"
+]
+
+# Session Lifecycle States
+SESSION_ACTIVE = "ACTIVE"
+SESSION_COMPLETED = "COMPLETED"
+SESSION_ABANDONED = "ABANDONED"
 # ---------------------------------------
 
 # State Definitions
@@ -41,9 +67,34 @@ timer_state = {
     "last_update_time": None,           # Last timer update timestamp
 }
 
+# Session Lifecycle State
+session_state = {
+    "lifecycle": SESSION_ACTIVE,        # Current session status
+    "goal_seconds": SESSION_GOAL_SECONDS,
+    "is_goal_reached": False,
+    "completion_time": None,
+    "task_title": "",                  # User-entered task
+    "task_type": "",                   # Selected category
+    "task_keyword": "",                # First word for typing challenge
+}
+
 # Interruption state
 interruption_active = False
 interruption_cap = None
+
+# Resume Screen State
+resume_screen_active = False
+resume_screen_trigger_time = None
+resume_screen_type = None  # "distraction" | "quit_attempt"
+distraction_start_time = None  # Track when DISTRACTED began
+
+# Resume Challenge
+resume_challenge = {
+    "gaze_start_time": None,      # When user started looking
+    "gaze_progress": 0.0,          # Current gaze duration
+    "typed_text": "",              # User's typed input
+    "challenge_type": "gaze"       # "gaze" | "typing"
+}
 
 # Temporal smoothing to prevent single-frame jitter
 presence_window = deque(maxlen=5)
@@ -64,6 +115,260 @@ def format_time(seconds):
         m = int((seconds % 3600) // 60)
         s = int(seconds % 60)
         return f"{h:02d}:{m:02d}:{s:02d}"
+
+def show_task_input_screen():
+    """Capture task details before session starts. Returns (title, type, keyword) or None if cancelled."""
+    # Create dummy VideoCapture for screen rendering
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Cannot open camera for task input")
+        return None
+    
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        return None
+    
+    h, w = frame.shape[:2]
+    
+    task_title = ""
+    selected_type_idx = 0  # Default to first type
+    
+    while True:
+        # Black background
+        screen = np.zeros((h, w, 3), dtype=np.uint8)
+        
+        # Header
+        cv2.putText(screen, "NEW SESSION SETUP", (w//2 - 280, 60),
+                    cv2.FONT_HERSHEY_DUPLEX, 1.8, (0, 255, 255), 3)
+        
+        # Instructions
+        cv2.putText(screen, "Enter your task details to begin:", (50, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 200, 200), 2)
+        
+        # Task Title Input
+        cv2.putText(screen, "Task Title:", (50, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        title_display = task_title + "_" if len(task_title) < 50 else task_title
+        cv2.putText(screen, title_display, (50, 220),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        
+        # Task Type Selection
+        cv2.putText(screen, "Task Type (press number to select):", (50, 280),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        y_pos = 320
+        for i, task_type in enumerate(TASK_TYPES):
+            if i == selected_type_idx:
+                color = (0, 255, 255)  # Cyan for selected
+                prefix = ">"
+            else:
+                color = (150, 150, 150)  # Gray for unselected
+                prefix = " "
+            
+            cv2.putText(screen, f"{prefix} [{i+1}] {task_type}", (50, y_pos),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            y_pos += 35
+        
+        # Bottom instructions
+        cv2.line(screen, (50, h - 100), (w - 50, h - 100), (100, 100, 100), 2)
+        cv2.putText(screen, "[ENTER] Start Session  |  [ESC] Cancel", (50, h - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        
+        cv2.imshow("Attention Monitor", screen)
+        
+        key = cv2.waitKey(28) & 0xFF
+        
+        if key == 27:  # ESC
+            cap.release()
+            cv2.destroyAllWindows()
+            return None
+        
+        elif key == 13:  # ENTER
+            if task_title.strip():  # Only proceed if title is not empty
+                # Extract first word as keyword
+                words = task_title.strip().split()
+                task_keyword = words[0].lower() if words else "focus"
+                
+                cap.release()
+                return (task_title.strip(), TASK_TYPES[selected_type_idx], task_keyword)
+        
+        elif key >= ord('1') and key <= ord('9'):  # Number keys
+            idx = key - ord('1')
+            if idx < len(TASK_TYPES):
+                selected_type_idx = idx
+        
+        elif key == 8:  # Backspace
+            if task_title:
+                task_title = task_title[:-1]
+        
+        elif 32 <= key <= 126:  # Printable characters
+            if len(task_title) < 50:  # Limit title length
+                task_title += chr(key)
+
+def activate_resume_screen(trigger_type):
+    """Activate the resume screen with specified trigger"""
+    global resume_screen_active, resume_screen_trigger_time, resume_screen_type
+    global resume_challenge, interruption_active, interruption_cap
+    
+    resume_screen_active = True
+    resume_screen_trigger_time = time.time()
+    resume_screen_type = trigger_type
+    
+    # Stop interruption video if playing
+    if interruption_active:
+        interruption_active = False
+        if interruption_cap:
+            interruption_cap.release()
+            interruption_cap = None
+    
+    # Reset challenge state
+    resume_challenge["gaze_start_time"] = None
+    resume_challenge["gaze_progress"] = 0.0
+    resume_challenge["typed_text"] = ""
+    resume_challenge["challenge_type"] = "gaze"
+    
+    print(f"[RESUME SCREEN] Activated - Reason: {trigger_type}")
+
+def deactivate_resume_screen(reason):
+    """Deactivate the resume screen"""
+    global resume_screen_active, distraction_start_time, state
+    
+    resume_screen_active = False
+    distraction_start_time = None
+    
+    # Force state to FOCUSED if challenge completed
+    if reason in ["gaze_complete", "typing_complete"]:
+        state = FOCUSED
+        timer_state["last_update_time"] = time.time()
+        timer_state["current_streak_seconds"] = 0.0  # Start fresh streak
+    
+    print(f"[RESUME SCREEN] Deactivated - Reason: {reason}")
+
+def render_completion_screen(frame):
+    """Draw success screen when session goal is reached"""
+    h, w = frame.shape[:2]
+    
+    # Green celebration background
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    overlay[:, :] = (0, 40, 0)  # Dark green tint
+    
+    # Celebration header
+    cv2.putText(overlay, "SESSION COMPLETE!", (w//2 - 350, 100),
+                cv2.FONT_HERSHEY_DUPLEX, 2.2, (0, 255, 0), 4)
+    
+    cv2.putText(overlay, "Congratulations!", (w//2 - 220, 170),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 255), 3)
+    
+    # Task completed
+    cv2.putText(overlay, f"Task: {session_state['task_title']}", (100, 220),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    cv2.putText(overlay, f"Type: {session_state['task_type']}", (100, 250),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2)
+    
+    # Stats Display
+    actual_time = session_state["completion_time"] - timer_state["session_start_time"]
+    efficiency = (timer_state["total_focused_seconds"] / actual_time * 100) if actual_time > 0 else 0
+    
+    y_pos = 300
+    cv2.putText(overlay, f"Goal Time:       {format_time(session_state['goal_seconds'])}", (100, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    y_pos += 60
+    cv2.putText(overlay, f"Focused Time:    {format_time(timer_state['total_focused_seconds'])}", (100, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    y_pos += 60
+    cv2.putText(overlay, f"Real Time:       {format_time(actual_time)}", (100, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (180, 180, 180), 2)
+    y_pos += 60
+    cv2.putText(overlay, f"Efficiency:      {efficiency:.1f}%", (100, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 165, 0), 2)
+    
+    # Actions
+    y_pos = h - 100
+    cv2.line(overlay, (50, y_pos - 20), (w - 50, y_pos - 20), (100, 255, 100), 2)
+    cv2.putText(overlay, "[Q] Quit  |  Press ESC to exit", (100, y_pos + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    
+    return overlay
+
+def render_resume_screen(frame):
+    """Draw fullscreen resume screen overlay"""
+    h, w = frame.shape[:2]
+    
+    # Black background
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # Header
+    cv2.putText(overlay, "RESUME SESSION?", (w//2 - 280, 80),
+                cv2.FONT_HERSHEY_DUPLEX, 1.8, (255, 255, 0), 3)
+    
+    # Task Info
+    cv2.putText(overlay, f"Task: {session_state['task_title']}", (50, 150),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    cv2.putText(overlay, f"Type: {session_state['task_type']}", (50, 185),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2)
+    
+    # Stats Display
+    now = time.time()
+    session_elapsed = now - timer_state["session_start_time"]
+    focus_pct = (timer_state["total_focused_seconds"] / session_elapsed * 100) if session_elapsed > 0 else 0
+    
+    y_pos = 210
+    cv2.putText(overlay, f"Session Time:   {format_time(session_elapsed)}", (50, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2)
+    y_pos += 45
+    cv2.putText(overlay, f"Focused Time:   {format_time(timer_state['total_focused_seconds'])}", (50, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    y_pos += 45
+    cv2.putText(overlay, f"Focus Rate:     {focus_pct:.1f}%", (50, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2)
+    
+    # Separator line
+    cv2.line(overlay, (50, y_pos + 35), (w - 50, y_pos + 35), (100, 100, 100), 2)
+    
+    # Challenge Options
+    y_pos += 75
+    cv2.putText(overlay, "Choose one to resume:", (50, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    
+    # Option 1: Gaze Challenge
+    y_pos += 55
+    option1_color = (0, 255, 255) if resume_challenge["challenge_type"] == "gaze" else (100, 100, 100)
+    cv2.putText(overlay, "[1] Look at screen for 2 seconds", (50, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, option1_color, 2)
+    
+    # Progress bar for gaze
+    if resume_challenge["challenge_type"] == "gaze":
+        progress = min(resume_challenge["gaze_progress"] / RESUME_GAZE_DURATION, 1.0)
+        bar_width = 400
+        bar_filled = int(bar_width * progress)
+        
+        y_pos += 35
+        cv2.rectangle(overlay, (50, y_pos), (50 + bar_width, y_pos + 20), (50, 50, 50), -1)
+        cv2.rectangle(overlay, (50, y_pos), (50 + bar_filled, y_pos + 20), (0, 255, 0), -1)
+        cv2.putText(overlay, f"{resume_challenge['gaze_progress']:.1f}s / {RESUME_GAZE_DURATION}s",
+                    (460, y_pos + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Option 2: Typing Challenge
+    y_pos += 55
+    option2_color = (0, 255, 255) if resume_challenge["challenge_type"] == "typing" else (100, 100, 100)
+    cv2.putText(overlay, f"[2] Type task keyword: '{session_state['task_keyword']}' + ENTER", (50, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, option2_color, 2)
+    
+    if resume_challenge["challenge_type"] == "typing":
+        y_pos += 35
+        input_text = resume_challenge["typed_text"] + "_"
+        cv2.putText(overlay, f"Input: {input_text}", (50, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # Action Buttons at bottom
+    y_pos = h - 80
+    cv2.line(overlay, (50, y_pos - 20), (w - 50, y_pos - 20), (100, 100, 100), 2)
+    cv2.putText(overlay, "[E] Abandon Session (will count as failure)", (50, y_pos + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 100, 100), 2)
+    
+    return overlay
 
 def eye_aspect_ratio(landmarks, eye_ids):
     """Calculate Eye Aspect Ratio for blink/closed eye detection"""
@@ -198,6 +503,22 @@ def result_callback(result, output_image, timestamp_ms):
         if now - last_present_time > MAX_ABSENCE_TIME:
             new_state = DISTRACTED
 
+    # Resume Screen Gaze Challenge Tracking
+    if resume_screen_active and resume_challenge["challenge_type"] == "gaze":
+        if new_state == FOCUSED or (state == FOCUSED and is_looking_forward):
+            if resume_challenge["gaze_start_time"] is None:
+                resume_challenge["gaze_start_time"] = now
+            else:
+                resume_challenge["gaze_progress"] = now - resume_challenge["gaze_start_time"]
+                
+                # Challenge complete!
+                if resume_challenge["gaze_progress"] >= RESUME_GAZE_DURATION:
+                    deactivate_resume_screen("gaze_complete")
+        else:
+            # Lost focus, reset
+            resume_challenge["gaze_start_time"] = None
+            resume_challenge["gaze_progress"] = 0.0
+    
     # Timer State Management
     if new_state != state:
         # Transitioning FROM FOCUSED - save accumulated time
@@ -243,7 +564,25 @@ options = vision.FaceLandmarkerOptions(
 )
 
 def main():
-    global interruption_active, interruption_cap
+    global interruption_active, interruption_cap, resume_screen_active
+    global distraction_start_time, state
+    
+    # Show task input screen BEFORE starting session
+    print('--- TASK SETUP ---')
+    task_input = show_task_input_screen()
+    
+    if task_input is None:
+        print('Session cancelled by user')
+        return
+    
+    task_title, task_type, task_keyword = task_input
+    session_state["task_title"] = task_title
+    session_state["task_type"] = task_type
+    session_state["task_keyword"] = task_keyword
+    
+    print(f'Task: {task_title}')
+    print(f'Type: {task_type}')
+    print(f'Keyword: {task_keyword}')
     
     video_cap = None
     audio_player = None
@@ -258,6 +597,15 @@ def main():
                 ret, frame = cap.read()
                 if not ret:
                     break
+                
+                # Track distraction duration for resume screen trigger
+                if state == DISTRACTED and not resume_screen_active:
+                    if distraction_start_time is None:
+                        distraction_start_time = time.time()
+                    elif time.time() - distraction_start_time > RESUME_SCREEN_THRESHOLD:
+                        activate_resume_screen("distraction")
+                elif state != DISTRACTED:
+                    distraction_start_time = None
 
                 # If DISTRACTED and not already interrupting, start video + audio
                 if state == DISTRACTED and not interruption_active:
@@ -324,6 +672,58 @@ def main():
                     timer_state["total_focused_seconds"] += delta
                     timer_state["current_streak_seconds"] += delta
                     timer_state["last_update_time"] = now
+                    
+                    # Check if goal reached
+                    if (not session_state["is_goal_reached"] and 
+                        timer_state["total_focused_seconds"] >= session_state["goal_seconds"]):
+                        
+                        session_state["is_goal_reached"] = True
+                        session_state["completion_time"] = now
+                        session_state["lifecycle"] = SESSION_COMPLETED
+                        print(f"\n🎉 SESSION GOAL REACHED! 🎉")
+                
+                # Completion Screen Handling
+                if session_state["lifecycle"] == SESSION_COMPLETED:
+                    frame = render_completion_screen(frame)
+                    cv2.imshow("Attention Monitor", frame)
+                    
+                    key = cv2.waitKey(28) & 0xFF
+                    if key == ord('q') or key == ord('Q') or key == 27:  # Q or ESC
+                        break
+                    
+                    continue  # Skip normal rendering
+                
+                # Resume Screen Handling
+                if resume_screen_active:
+                    frame = render_resume_screen(frame)
+                    cv2.imshow("Attention Monitor", frame)
+                    
+                    key = cv2.waitKey(28) & 0xFF
+                    
+                    if key == ord('1'):
+                        resume_challenge["challenge_type"] = "gaze"
+                        resume_challenge["typed_text"] = ""
+                    elif key == ord('2'):
+                        resume_challenge["challenge_type"] = "typing"
+                        resume_challenge["gaze_start_time"] = None
+                        resume_challenge["gaze_progress"] = 0.0
+                    elif key == ord('e') or key == ord('E'):
+                        # Abandon session
+                        session_state["lifecycle"] = SESSION_ABANDONED
+                        break
+                    elif resume_challenge["challenge_type"] == "typing":
+                        if key == 13:  # Enter
+                            if resume_challenge["typed_text"].lower() == session_state["task_keyword"].lower():
+                                deactivate_resume_screen("typing_complete")
+                            else:
+                                resume_challenge["typed_text"] = ""  # Wrong keyword, reset
+                        elif key == 8:  # Backspace
+                            if resume_challenge["typed_text"]:
+                                resume_challenge["typed_text"] = resume_challenge["typed_text"][:-1]
+                        elif 32 <= key <= 126:  # Printable characters
+                            resume_challenge["typed_text"] += chr(key)
+                    
+                    continue  # Skip normal rendering
                 
                 # Show debug overlay (only when not interrupting)
                 if not interruption_active:
@@ -336,6 +736,12 @@ def main():
                     
                     # State indicator
                     cv2.putText(frame, state, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+                    
+                    # Task type badge (top-right)
+                    h, w = frame.shape[:2]
+                    badge_text = f"{session_state['task_type']}"
+                    cv2.putText(frame, badge_text, (w - 220, 35), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 200, 255), 2)
                     
                     # Pose debug info
                     cv2.putText(
@@ -380,11 +786,60 @@ def main():
                         (255, 165, 0),
                         2
                     )
+                    
+                    # Goal Progress Display
+                    goal_progress = min(timer_state["total_focused_seconds"] / session_state["goal_seconds"], 1.0)
+                    goal_remaining = max(session_state["goal_seconds"] - timer_state["total_focused_seconds"], 0)
+                    
+                    # Goal info
+                    cv2.putText(
+                        frame,
+                        f"GOAL:    {format_time(session_state['goal_seconds'])}",
+                        (20, 230),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (100, 200, 255),
+                        2
+                    )
+                    
+                    cv2.putText(
+                        frame,
+                        f"REMAIN:  {format_time(goal_remaining)}",
+                        (20, 265),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (200, 200, 100),
+                        2
+                    )
+                    
+                    # Progress bar
+                    bar_width = 300
+                    bar_filled = int(bar_width * goal_progress)
+                    bar_y = 280
+                    
+                    cv2.rectangle(frame, (20, bar_y), (20 + bar_width, bar_y + 20), (50, 50, 50), -1)
+                    cv2.rectangle(frame, (20, bar_y), (20 + bar_filled, bar_y + 20), (0, 255, 0), -1)
+                    
+                    cv2.putText(
+                        frame,
+                        f"{goal_progress * 100:.1f}%",
+                        (330, bar_y + 15),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (255, 255, 255),
+                        1
+                    )
 
                 cv2.imshow("Attention Monitor", frame)
 
-                if cv2.waitKey(28) & 0xFF == 27:  # ESC to exit, ~28ms = 30fps
-                    break
+                key = cv2.waitKey(28) & 0xFF
+                if key == 27:  # ESC
+                    # If session has started, show resume screen instead of exiting
+                    if timer_state["total_focused_seconds"] > 0 and not resume_screen_active:
+                        activate_resume_screen("quit_attempt")
+                    else:
+                        # No focus time yet, allow immediate exit
+                        break
 
         # Cleanup
         if video_cap is not None:
@@ -397,11 +852,29 @@ def main():
         # Print Final Session Summary
         final_session = time.time() - timer_state["session_start_time"]
         print("\n" + "="*50)
-        print("SESSION SUMMARY - THE TRUTH")
+        
+        if session_state["lifecycle"] == SESSION_COMPLETED:
+            print("🎉 SESSION COMPLETED SUCCESSFULLY! 🎉")
+        elif session_state["lifecycle"] == SESSION_ABANDONED:
+            print("❌ SESSION ABANDONED")
+            completion_pct = (timer_state["total_focused_seconds"] / session_state["goal_seconds"] * 100)
+            print(f"Goal Progress: {completion_pct:.1f}%")
+        else:
+            print("SESSION SUMMARY - THE TRUTH")
+        
         print("="*50)
+        print(f"Task: {session_state['task_title']}")
+        print(f"Type: {session_state['task_type']}")
+        print("="*50)
+        print(f"Goal Target:           {format_time(session_state['goal_seconds'])}")
         print(f"Total Session Time:    {format_time(final_session)}")
         print(f"Actual Focused Time:   {format_time(timer_state['total_focused_seconds'])}")
         print(f"Focus Percentage:      {(timer_state['total_focused_seconds'] / final_session * 100):.1f}%")
+        
+        if session_state["lifecycle"] == SESSION_COMPLETED:
+            efficiency = (timer_state["total_focused_seconds"] / final_session * 100)
+            print(f"Session Efficiency:    {efficiency:.1f}%")
+        
         print("="*50)
         
     except Exception as e:
